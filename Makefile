@@ -38,19 +38,29 @@ LOCALES =
 # translation
 SOURCES = \
 	__init__.py \
-	ags_tools.py 
+	ags_tools.py \
+	ags_2_db_algorithm.py \
+	ags_2_csv.py \
+	ags_tools_provider.py \
+	ags_validator.py \
+	expected_groups.py 
 
 PLUGINNAME = ags_tools
 
 PY_FILES = \
 	__init__.py \
-	ags_tools.py 
+	ags_tools.py \
+	ags_2_db_algorithm.py \
+	ags_2_csv.py \
+	ags_tools_provider.py \
+	ags_validator.py \
+	expected_groups.py 
 
 UI_FILES = 
 
-EXTRAS = metadata.txt 
+EXTRAS = metadata.txt LICENSE 
 
-EXTRA_DIRS =
+EXTRA_DIRS = core help i18n
 
 COMPILED_RESOURCE_FILES = 
 

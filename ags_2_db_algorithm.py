@@ -37,6 +37,8 @@ from qgis.core import (QgsApplication,
 					   QgsProcessingAlgorithm,
 					   QgsProcessingParameterFile,
 					   QgsProcessingParameterFileDestination,
+					   QgsProcessingParameterBoolean,
+					   QgsProcessingParameterString,
 					   QgsProcessingParameterCrs,
 					   QgsCoordinateReferenceSystem,
 					   QgsVectorLayer,
@@ -58,6 +60,16 @@ from qgis.utils import iface
 from io import StringIO
 # import sqlite3
 import os
+from pathlib import Path
+
+if __package__:
+	from .core.parser import AGSParser
+	from .core.transformer import AGSTransformer
+	from .core.exporter import CSVExporter
+else:
+	from core.parser import AGSParser
+	from core.transformer import AGSTransformer
+	from core.exporter import CSVExporter
 
 
 class AGS2DBAlgorithm(QgsProcessingAlgorithm):
@@ -80,7 +92,12 @@ class AGS2DBAlgorithm(QgsProcessingAlgorithm):
 
 	OUTPUT = 'OUTPUT'
 	INPUT = 'INPUT'
+	DATA_DESC = 'DATA_DESC'
 	CRS = 'CRS'
+	EXPORT_CSV = 'EXPORT_CSV'
+	CSV_OUTPUT_DIR = 'CSV_OUTPUT_DIR'
+	CSV_OUTPUT_FOLDER_NAME = 'CSV_OUTPUT_FOLDER_NAME'
+	CSV_APPEND_MODE = 'CSV_APPEND_MODE'
 
 	def initAlgorithm(self, config):
 		"""
@@ -93,7 +110,7 @@ class AGS2DBAlgorithm(QgsProcessingAlgorithm):
 		self.addParameter(
 			QgsProcessingParameterFile(
 				self.INPUT,
-				self.tr('Input File'),
+				self.tr('Input AGS file(s)'),
 				
 			)
 		)
@@ -101,23 +118,79 @@ class AGS2DBAlgorithm(QgsProcessingAlgorithm):
 		self.addParameter(
 			QgsProcessingParameterCrs(
 				self.CRS,
-				'Coordinate Reference System',
+				self.tr('Coordinate reference system'),
 				defaultValue=QgsCoordinateReferenceSystem('EPSG:27700')
 			)
 		)
 
-
-		# We add a feature sink in which to store our processed features (this
-		# usually takes the form of a newly created vector layer when the
-		# algorithm is run in QGIS).
+		# Use FileDestination parameter for proper "Save As" dialog
 		self.addParameter(
 			QgsProcessingParameterFileDestination(
 				self.OUTPUT,
-				self.tr('Output File'),
+				self.tr('Output Database File'),
 				fileFilter='GeoPackage (*.gpkg);;SpatiaLite (*.sqlite)'
 				
 			)
 		)
+
+		self.addParameter(
+			QgsProcessingParameterString(
+				self.DATA_DESC,
+				self.tr('Description of proposed use of data'),
+				defaultValue='',
+				optional=True
+			)
+		)
+
+		self.addParameter(
+			QgsProcessingParameterBoolean(
+				self.EXPORT_CSV,
+				self.tr('\nCreate CSV Files for plotting in PowerBI'),
+				defaultValue=False
+			)
+		)
+
+		csv_output_dir_param = QgsProcessingParameterFile(
+			self.CSV_OUTPUT_DIR,
+			self.tr('Output CSV Database Folder (existing or new)'),
+			behavior=QgsProcessingParameterFile.Folder,
+			optional=True
+		)
+		csv_output_dir_param.setMetadata({
+			'widget_wrapper': {
+				'depends_on': self.EXPORT_CSV,
+				'depends_on_value': True
+			}
+		})
+		self.addParameter(csv_output_dir_param)
+
+		csv_output_folder_name_param = QgsProcessingParameterString(
+			self.CSV_OUTPUT_FOLDER_NAME,
+			self.tr('Folder name of CSV database (leave blank if appending to existing folder)'),
+			defaultValue='',
+			optional=True
+		)
+		csv_output_folder_name_param.setMetadata({
+			'widget_wrapper': {
+				'depends_on': self.EXPORT_CSV,
+				'depends_on_value': True
+			}
+		})
+		self.addParameter(csv_output_folder_name_param)
+
+		csv_append_param = QgsProcessingParameterBoolean(
+			self.CSV_APPEND_MODE,
+			self.tr('Append to existing CSV files'),
+			defaultValue=False,
+			optional=True
+		)
+		csv_append_param.setMetadata({
+			'widget_wrapper': {
+				'depends_on': self.EXPORT_CSV,
+				'depends_on_value': True
+			}
+		})
+		self.addParameter(csv_append_param)
 
 	def parse_ags_file(self, file_contents):
 
@@ -330,7 +403,9 @@ class AGS2DBAlgorithm(QgsProcessingAlgorithm):
 
 	def processAlgorithm(self, parameters, context, feedback):
 		# Define the output path
-		output_path = self.parameterAsFileOutput(parameters, self.OUTPUT, context)
+		output_path = self.parameterAsString(parameters, self.OUTPUT, context)
+		if not output_path:
+			raise QgsProcessingException("DB output file is required.")
 		ext = os.path.splitext(output_path)[1].lower()
 		feedback.pushInfo(f"Writing all groups GeoPackage to: {output_path}")
 
@@ -346,9 +421,40 @@ class AGS2DBAlgorithm(QgsProcessingAlgorithm):
 
 		# Get chosen CRS
 		crs = self.parameterAsCrs(parameters, self.CRS, context)
+		data_desc = self.parameterAsString(parameters, self.DATA_DESC, context)
+		data_desc = (data_desc or '').strip()
 
 		# Parse the AGS file
 		data, column_types = self.parse_ags_file(file_contents)
+
+		ags_filename = Path(ags_file_path).name
+		db_filename = Path(output_path).name
+		proj_id = ''
+		if 'PROJ' in data:
+			for record in data['PROJ']:
+				proj_val = str(record.get('PROJ_ID', '') or '').strip()
+				if proj_val:
+					proj_id = proj_val
+					break
+		
+		# For AGS2DB, source_file format: ags_filename|db_filename|project_id
+		# This provides full traceability: where data came from (AGS), where it went (DB), and what project
+		source_file_value = f"{ags_filename}|{db_filename}|{proj_id}" if proj_id else f"{ags_filename}|{db_filename}"
+
+		# Ensure provenance fields exist across all DB tables
+		for group_name, records in data.items():
+			if group_name.endswith("_units"):
+				continue
+			column_types.setdefault(group_name, {})['source_file'] = 'TEXT'
+			for record in records:
+				if not str(record.get('source_file', '') or '').strip():
+					record['source_file'] = source_file_value
+
+		# Inject user-supplied description into PROJ records for DB output.
+		if 'PROJ' in data:
+			for record in data['PROJ']:
+				record['data_desc'] = data_desc
+			column_types.setdefault('PROJ', {})['data_desc'] = 'TEXT'
 
 		first_layer = True
 		transform_context = context.transformContext()
@@ -432,14 +538,90 @@ class AGS2DBAlgorithm(QgsProcessingAlgorithm):
 		# After the writing is done, call the helper functions:
 		self.add_svg_paths(feedback)
 
-
-
 		qml_path = os.path.join(os.path.dirname(__file__), 'styles', 'loca_spatial.qml')
 
     	# Load and style the LOCA layer
 		self.loadLayerAndApplyStyle(output_path, "LOCA", qml_path, feedback)
 
 		self.create_database_connection(output_path, feedback)
+
+		# ====== CSV EXPORT (conditional) ======
+		export_csv = self.parameterAsBool(parameters, self.EXPORT_CSV, context)
+		if export_csv:
+			csv_parent_dir = self.parameterAsString(parameters, self.CSV_OUTPUT_DIR, context)
+			csv_output_folder_name = self.parameterAsString(parameters, self.CSV_OUTPUT_FOLDER_NAME, context)
+			append_mode = self.parameterAsBool(parameters, self.CSV_APPEND_MODE, context)
+			
+			if not csv_parent_dir:
+				raise QgsProcessingException("CSV export enabled but no parent folder specified.")
+
+			folder_name = (csv_output_folder_name or "").strip()
+			if folder_name:
+				csv_output_dir = os.path.join(csv_parent_dir, folder_name)
+			else:
+				# If appending, use selected folder directly; otherwise create default subfolder.
+				if append_mode:
+					csv_output_dir = csv_parent_dir
+				else:
+					csv_output_dir = os.path.join(csv_parent_dir, 'ags_csv_export')
+			
+			# Determine overwrite/append behavior from explicit user selection
+			if os.path.exists(csv_output_dir):
+				csv_files = [f for f in os.listdir(csv_output_dir) if f.endswith('.csv')]
+				if csv_files:
+					if append_mode:
+						feedback.pushInfo("Appending to existing CSVs...")
+					else:
+						feedback.pushInfo("Overwriting existing CSVs...")
+			else:
+				if append_mode:
+					feedback.pushInfo("Append mode selected, but no existing CSV folder found. New CSV files will be created.")
+			
+			feedback.pushInfo(f"Exporting AGS to CSV folder: {csv_output_dir}")
+			
+			try:
+				# Parse AGS file
+				parser = AGSParser(ags_file_path)
+				parser.load()
+				feedback.pushInfo("AGS file loaded for CSV export")
+				
+				# Transform and export
+				source_file = Path(ags_file_path).name
+				transformer = AGSTransformer(parser, source_file, data_desc=data_desc)
+				exporter = CSVExporter(csv_output_dir, append_mode=append_mode)
+				
+				# Tables to export (from ags_2_csv.py TABLES list)
+				tables = [
+					"proj", "loca", "samp", "bkfl", "geol", "detl", "ispt", "core", "weth", "frac",
+					"hdph", "wins", "wstg", "wstd", "mong", "mond", "dcpg", "dcpt", "dprg", "icbr",
+					"ipid", "ivan", "chis", "ptim", "lpdn", "llpl", "grat", "grag", "mcvg", "lnmc",
+					"mcvt", "cbrg", "cbrt", "cmpg", "cmpt", "cong", "cons", "shbg", "shbt", "trig",
+					"trit", "gchm", "eres"
+				]
+				
+				for table in tables:
+					if feedback.isCanceled():
+						feedback.pushInfo("CSV export cancelled by user.")
+						break
+					
+					method_name = f"transform_{table}"
+					transform_method = getattr(transformer, method_name, None)
+					if transform_method is None:
+						feedback.pushInfo(f"Skipping {table}: no transform method")
+						continue
+					
+					try:
+						df = transform_method()
+						exporter.write(table, df, source_file)
+						feedback.pushInfo(f"Wrote {table}.csv ({len(df)} rows)")
+					except Exception as e:
+						feedback.reportError(f"Error transforming {table}: {str(e)}")
+				
+				exporter.write_manifest()
+				feedback.pushInfo("CSV export complete - wrote manifest.csv")
+				
+			except Exception as e:
+				feedback.reportError(f"CSV export failed: {str(e)}")
 
 		return {self.OUTPUT: output_path}
 	
