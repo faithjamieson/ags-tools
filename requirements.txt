@@ -1,0 +1,4 @@
+# Requires GDAL / QGIS installation (not pip)
+pandas==3.0.2
+pyproj==3.6.1
+python_ags4==1.2.0
